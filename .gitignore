@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+
+# Data files (exclude Excel exports, keep JSON config if needed)
+*.xlsx
+*.xls
+*.csv
