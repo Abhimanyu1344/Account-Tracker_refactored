@@ -11,3 +11,4 @@ env/
 *.xlsx
 *.xls
 *.csv
+.vscode/
