@@ -12,3 +12,4 @@ env/
 *.xls
 *.csv
 .vscode/
+.CLAUDE.md

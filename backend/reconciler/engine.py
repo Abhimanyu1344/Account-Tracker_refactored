@@ -22,9 +22,10 @@ from typing import Optional
 from datetime import datetime
 
 from backend.config import (
+    DATA_DIR,
     MATCH_TOLERANCE,
     CLEARING_ROUNDING_THRESHOLD,
-    HIGH_CONF,
+    HIGH_CONF,    # Reserved for future confidence-tiered review workflow
     LOW_CONF,
     BRANCH_FUZZY_THRESHOLD,
 )
@@ -46,6 +47,13 @@ from backend.parsers.debtors import (
 
 # Vertical that needs CPV/CPD sub-split
 CREDIT_VERTICAL = "Credit"
+
+_SUSPENSE_PARTICULARS = {"SUSPENSE", "SUSPENSE A/C", "SUSPENSE AC", "SUSPENSE ACCOUNT", "SUSPENSE LEDGER"}
+
+# Minimum fraction of bill amount for a single payment to be treated as
+# an underpayment in Step 2. Payments below this fraction are left pending
+# so Step 2b can aggregate them into a matching group sum.
+MIN_PARTIAL_RATIO = 0.5
 
 
 def _within_tolerance(inv_amt: float, pay_amt: float, tol: float = MATCH_TOLERANCE) -> bool:
@@ -72,7 +80,7 @@ class Reconciler:
         summary           → counts and totals
     """
 
-    def __init__(self, kb_path: str = "master_client_knowledge_base.json",
+    def __init__(self, kb_path: str = str(DATA_DIR / "master_client_knowledge_base.json"),
                  validator: Validator = None, kb_bridge: dict = None):
         """
         R9: Dependency injection — accepts pre-built validator and bridge.
@@ -135,9 +143,22 @@ class Reconciler:
         credit_col = "Credit"
         if credit_col not in s3.columns:
             credit_col = next((c for c in s3.columns if "credit" in c.lower()), None)
-        s3["_Remaining"]  = pd.to_numeric(s3[credit_col], errors="coerce").fillna(0).astype(float) if credit_col else 0.0
+
+        if credit_col is None:
+            available_cols = list(s3.columns)
+            raise ValueError(
+                f"Suspense file for vertical '{vertical}' has no recognisable credit/inflow column. "
+                f"Available columns: {available_cols}. "
+                f"Expected a column named 'Credit' or containing 'credit'. "
+                f"Check that the correct Suspense file was uploaded for this vertical."
+            )
+
+        s3["_Remaining"]  = pd.to_numeric(s3[credit_col], errors="coerce").fillna(0).astype(float)
         s3["_Applied"]    = 0.0
         s3["_Status"]     = SuspenseStatus.OPEN
+        s3["_cached_resolved_name"] = ""
+        s3["_cached_confidence"]    = 0.0
+        s3["_cached_method"]        = ""
 
         # Client resolver — built once per vertical, using pre-loaded validator
         all_debtors_names = d1["Party's Name"].dropna().unique().tolist()
@@ -182,6 +203,48 @@ class Reconciler:
         statement_rows += step2b_statement
         kb_gaps_rows   += step2b_gaps
         print(f"    → {len(step2b_statement)} aggregate matches, {len(step2b_gaps)} remaining gaps")
+
+        # Remove stale Amount Mismatch kb_gaps that Step 2b has since resolved.
+        # A suspense entry is considered resolved if its _Remaining dropped to 0
+        # after the aggregation pass. Match on narration as the join key.
+        resolved_narrations = set(
+            s3.loc[s3["_Remaining"] <= CLEARING_ROUNDING_THRESHOLD, "Narration"]
+            .astype(str)
+            .str.strip()
+        )
+        kb_gaps_rows = [
+            gap for gap in kb_gaps_rows
+            if not (
+                gap.get("Action_Required") == GapReason.AMOUNT_MISMATCH
+                and str(gap.get("Narration", "")).strip() in resolved_narrations
+            )
+        ]
+
+        # ── Step 2c: Cross-branch aggregation pass ────────────────────────────
+        # Groups by (resolved_BASE, quarter) — strips branch suffix so payments
+        # tagged to different branches (e.g. Cholamandalam_Jalna + _Ahmednagar)
+        # pool together and match against any open bill for that client.
+        print("\n  Step 2c: Cross-branch aggregation pass (multi-branch → single bill)...")
+        d1, s3, stmt_2c, gaps_2c = self._apply_suspense_cross_branch(
+            d1, s3, resolver, vertical
+        )
+        statement_rows.extend(stmt_2c)
+        kb_gaps_rows.extend(gaps_2c)
+        print(f"    → {len(stmt_2c)} cross-branch matches, {len(gaps_2c)} remaining gaps")
+
+        # Remove stale Amount Mismatch gaps resolved by Step 2c.
+        resolved_narrations_2c = set(
+            s3.loc[s3["_Remaining"] <= CLEARING_ROUNDING_THRESHOLD, "Narration"]
+            .astype(str)
+            .str.strip()
+        )
+        kb_gaps_rows = [
+            gap for gap in kb_gaps_rows
+            if not (
+                gap.get("Action_Required") == GapReason.AMOUNT_MISMATCH
+                and str(gap.get("Narration", "")).strip() in resolved_narrations_2c
+            )
+        ]
 
         # ── Step 3: Build outputs ─────────────────────────────────────────────
         updated_debtors  = self._build_updated_debtors(d1)
@@ -264,7 +327,7 @@ class Reconciler:
         # Filter: only direct receipts (Particulars != 'Suspense')
         particulars_col = "Particulars"
         direct = receipts_df[
-            receipts_df[particulars_col].str.strip().str.upper() != "SUSPENSE"
+            ~receipts_df[particulars_col].str.strip().str.upper().isin(_SUSPENSE_PARTICULARS)
         ].copy()
 
         if direct.empty:
@@ -317,6 +380,18 @@ class Reconciler:
                     "Action_Required":   GapReason.UNKNOWN_CLIENT,
                 }
                 kb_gaps.append(entry)
+                continue
+
+            if resolution.confidence < LOW_CONF:
+                unresolvable.append({
+                    "Vertical":  vertical,
+                    "Source":    "Receipt",
+                    "Date":      rec.get("Date"),
+                    "Raw_Text":  raw_text,
+                    "Amount":    debit_amt,
+                    "Reason":    UnresolvableReason.CONFIDENCE_TOO_LOW,
+                    "Narration": rec.get("Narration", ""),
+                })
                 continue
 
             resolved_name = resolution.resolved_name
@@ -417,7 +492,22 @@ class Reconciler:
                 kb_gaps.append(entry)
                 continue
 
+            if resolution.confidence < LOW_CONF:
+                unresolvable.append({
+                    "Vertical":  vertical,
+                    "Source":    "Suspense",
+                    "Date":      susp.get("Date"),
+                    "Raw_Text":  client_hint,
+                    "Amount":    remaining,
+                    "Reason":    UnresolvableReason.CONFIDENCE_TOO_LOW,
+                    "Narration": narration,
+                })
+                continue
+
             resolved_name = resolution.resolved_name
+            s3.at[idx, "_cached_resolved_name"] = resolved_name
+            s3.at[idx, "_cached_confidence"]    = resolution.confidence
+            s3.at[idx, "_cached_method"]        = resolution.method
 
             # CPV/CPD for suspense in Credit vertical
             # Try to infer from narration or ref if available
@@ -491,14 +581,26 @@ class Reconciler:
             narration = str(susp.get("Narration", "")).strip()
             if not narration:
                 continue
-            client_hint = _parse_neft_client(narration)
-            if not client_hint:
-                continue
-            resolution = resolver.resolve(client_hint)
-            if resolution.resolved_name is None:
-                continue
+            cached_name = s3.at[idx, "_cached_resolved_name"] if "_cached_resolved_name" in s3.columns else ""
+            if not cached_name:
+                # Step 2 resolution failed for this entry — attempt independent resolution.
+                # This is the exact case the aggregation pass was built for: clients whose
+                # individual payments fail 1-to-1 matching but whose grouped sum matches a bill.
+                # Do NOT skip — fall through to independent resolution.
+                client_hint = _parse_neft_client(narration)
+                if not client_hint:
+                    continue
+                resolution = resolver.resolve(client_hint)
+                if resolution.resolved_name is None:
+                    continue
+                resolved_name = resolution.resolved_name
+                cached_confidence = resolution.confidence
+                cached_method = resolution.method
+            else:
+                resolved_name = cached_name
+                cached_confidence = s3.at[idx, "_cached_confidence"] if "_cached_confidence" in s3.columns else 0.0
+                cached_method     = s3.at[idx, "_cached_method"]     if "_cached_method"     in s3.columns else "CACHED"
 
-            resolved_name = resolution.resolved_name
             resolved_base = _normalise_base(_extract_client_base(resolved_name))
 
             # Quarter key — group payments within the same rolling quarter
@@ -522,9 +624,8 @@ class Reconciler:
                 "narration":      narration,
                 "date":           susp.get("Date"),
                 "vch_no":         str(susp.get("Vch No.", susp.get("Vch No", ""))),
-                "confidence":     resolution.confidence,
-                "method":         resolution.method,
-                "client_hint":    client_hint,
+                "confidence":     cached_confidence,
+                "method":         cached_method,
             })
 
         if not entry_meta:
@@ -532,10 +633,11 @@ class Reconciler:
 
         meta_df = pd.DataFrame(entry_meta)
 
-        # ── Group by client base + month ──────────────────────────────────────
-        for (resolved_base, month_key), group in meta_df.groupby(
-            ["resolved_base", "month_key"], sort=False
+        # ── Group by client name + month ──────────────────────────────────────
+        for (resolved_name_group, month_key), group in meta_df.groupby(
+            ["resolved_name", "month_key"], sort=False
         ):
+            resolved_base = _normalise_base(_extract_client_base(resolved_name_group))
             if len(group) < 2:
                 # Single entry — already tried 1-to-1 in Step 2, skip
                 continue
@@ -585,9 +687,6 @@ class Reconciler:
             # Attempt to match group_sum against bills FIFO
             remaining_pool = group_sum
             group_indices  = list(group["idx"])
-            entry_remainders = {
-                row["idx"]: row["remaining"] for _, row in group.iterrows()
-            }
 
             # Representative metadata from first entry
             rep = group.iloc[0]
@@ -673,6 +772,206 @@ class Reconciler:
 
             # If the group sum didn't match anything, leave entries open.
             # They were already logged as KB gaps in Step 2 — don't double-log.
+
+        return d1, s3, statement, kb_gaps
+
+    # ── Step 2c: Cross-branch aggregation pass ────────────────────────────────
+
+    def _apply_suspense_cross_branch(self, d1, s3, resolver, vertical):
+        """
+        Third-pass suspense matching: aggregate payments by (resolved_BASE, quarter)
+        so entries tagged to different branches of the same client pool together.
+
+        Targets clients whose payments resolve to branch-specific names
+        (e.g. CHOLAMANDALAM_JALNA, CHOLAMANDALAM_AHMEDNAGAR) but whose open bills
+        exist under a consolidated or different branch. Step 2b leaves these
+        unmatched because it groups by resolved_name (branch-specific). This pass
+        groups by resolved_base instead, ignoring the branch suffix.
+
+        Does NOT re-process entries already fully applied.
+        Does NOT generate new KB gaps — unmatched entries were already logged.
+        """
+        statement = []
+        kb_gaps   = []
+
+        open_mask = s3["_Remaining"] > 0
+        if not open_mask.any():
+            return d1, s3, statement, kb_gaps
+
+        entry_meta = []
+        for idx, susp in s3[open_mask].iterrows():
+            narration = str(susp.get("Narration", "")).strip()
+            if not narration:
+                continue
+            cached_name = s3.at[idx, "_cached_resolved_name"] if "_cached_resolved_name" in s3.columns else ""
+            if not cached_name:
+                client_hint = _parse_neft_client(narration)
+                if not client_hint:
+                    continue
+                resolution = resolver.resolve(client_hint)
+                if resolution.resolved_name is None:
+                    continue
+                resolved_name     = resolution.resolved_name
+                cached_confidence = resolution.confidence
+                cached_method     = resolution.method
+            else:
+                resolved_name     = cached_name
+                cached_confidence = s3.at[idx, "_cached_confidence"] if "_cached_confidence" in s3.columns else 0.0
+                cached_method     = s3.at[idx, "_cached_method"]     if "_cached_method"     in s3.columns else "CACHED"
+
+            resolved_base = _normalise_base(_extract_client_base(resolved_name))
+
+            date_str = str(susp.get("Date", ""))
+            try:
+                parsed_date = datetime.strptime(date_str, "%d-%b-%Y")
+                _q = (parsed_date.month - 1) // 3 + 1
+                month_key = f"Q{_q}-{parsed_date.year}"
+            except Exception:
+                month_key = "UNKNOWN"
+
+            entry_meta.append({
+                "idx":            idx,
+                "resolved_name":  resolved_name,
+                "resolved_base":  resolved_base,
+                "month_key":      month_key,
+                "remaining":      s3.at[idx, "_Remaining"],
+                "narration":      narration,
+                "date":           susp.get("Date"),
+                "vch_no":         str(susp.get("Vch No.", susp.get("Vch No", ""))),
+                "confidence":     cached_confidence,
+                "method":         cached_method,
+            })
+
+        if not entry_meta:
+            return d1, s3, statement, kb_gaps
+
+        meta_df = pd.DataFrame(entry_meta)
+
+        # ── Group by BASE name + quarter (key difference from Step 2b) ────────
+        for (resolved_base_group, month_key), group in meta_df.groupby(
+            ["resolved_base", "month_key"], sort=False
+        ):
+            resolved_base = resolved_base_group
+            if len(group) < 2:
+                # Single entry — Step 2b already attempted it, skip.
+                continue
+
+            group_sum = group["remaining"].sum()
+            if group_sum <= 0:
+                continue
+
+            # Candidate bills — ALL branches of this base name
+            candidates = d1[
+                (d1["_Remaining"] > 0) &
+                (d1["_base_name"] == resolved_base)
+            ].copy()
+
+            if candidates.empty:
+                continue
+
+            # CPV/CPD filter for Credit vertical
+            prefix = None
+            if vertical == CREDIT_VERTICAL:
+                vch_no = group.iloc[0]["vch_no"]
+                prefix = extract_ref_prefix(vch_no)
+                if prefix:
+                    prefixed = candidates[
+                        candidates["Ref. No."].apply(
+                            lambda r: extract_ref_prefix(str(r)) == prefix
+                        )
+                    ]
+                    if not prefixed.empty:
+                        candidates = prefixed
+
+            # Sort FIFO
+            candidates = candidates.copy()
+            candidates["_dp"] = pd.to_datetime(
+                candidates["Date"], format="%d-%b-%Y", errors="coerce"
+            )
+            candidates = candidates.sort_values("_dp", na_position="last")
+
+            group = group.copy()
+            group["_dp"] = pd.to_datetime(
+                group["date"], format="%d-%b-%Y", errors="coerce"
+            )
+            group = group.sort_values("_dp", na_position="last")
+
+            remaining_pool = group_sum
+            group_indices  = list(group["idx"])
+            rep            = group.iloc[0]
+
+            for bill_idx, bill in candidates.iterrows():
+                if remaining_pool <= 0:
+                    break
+
+                bill_remaining = d1.at[bill_idx, "_Remaining"]
+                if bill_remaining <= 0:
+                    continue
+
+                if not _within_tolerance(bill_remaining, remaining_pool):
+                    if remaining_pool <= bill_remaining * (1 + MATCH_TOLERANCE):
+                        continue
+                    apply_to_bill = bill_remaining
+                else:
+                    apply_to_bill = remaining_pool
+
+                to_distribute = apply_to_bill
+                cleared_refs  = []
+                cleared_dates = []
+
+                for entry_idx in group_indices:
+                    if to_distribute <= 0:
+                        break
+                    entry_rem = s3.at[entry_idx, "_Remaining"]
+                    if entry_rem <= 0:
+                        continue
+                    applied = min(entry_rem, to_distribute)
+                    s3.at[entry_idx, "_Applied"]   += applied
+                    s3.at[entry_idx, "_Remaining"]  = max(0, entry_rem - applied)
+                    if s3.at[entry_idx, "_Remaining"] <= CLEARING_ROUNDING_THRESHOLD:
+                        s3.at[entry_idx, "_Status"] = SuspenseStatus.FULLY_APPLIED
+                    else:
+                        s3.at[entry_idx, "_Status"] = SuspenseStatus.PARTIALLY_APPLIED
+                    to_distribute -= applied
+                    vch = str(s3.at[entry_idx, "Vch No."] if "Vch No." in s3.columns
+                              else s3.at[entry_idx, "Vch No"] if "Vch No" in s3.columns
+                              else entry_idx)
+                    cleared_refs.append(vch)
+                    cleared_dates.append(str(s3.at[entry_idx, "Date"]))
+
+                d1.at[bill_idx, "_Remaining"]      = max(0, bill_remaining - apply_to_bill)
+                d1.at[bill_idx, "_Cleared_Amount"] += apply_to_bill
+                d1.at[bill_idx, "_Cleared_By"]     += (
+                    (", " if d1.at[bill_idx, "_Cleared_By"] else "") + "Suspense"
+                )
+                d1.at[bill_idx, "_Cleared_Ref"] += (
+                    (", " if d1.at[bill_idx, "_Cleared_Ref"] else "") +
+                    "+".join(cleared_refs)
+                )
+                if d1.at[bill_idx, "_Remaining"] <= CLEARING_ROUNDING_THRESHOLD:
+                    d1.at[bill_idx, "_Status"] = BillStatus.CLEARED
+                else:
+                    d1.at[bill_idx, "_Status"] = BillStatus.PARTIALLY_CLEARED
+
+                statement.append({
+                    "Vertical":         vertical,
+                    "Client":           rep["resolved_name"],
+                    "Bill_Ref":         bill.get("Ref. No.", ""),
+                    "Bill_Date":        bill.get("Date", ""),
+                    "Bill_Amount":      bill.get("Pending Amount", ""),
+                    "Cleared_By":       "Suspense",
+                    "Cleared_Ref":      "+".join(cleared_refs),
+                    "Cleared_Date":     rep["date"],
+                    "Cleared_Amount":   round(apply_to_bill, 2),
+                    "Remaining_After":  round(d1.at[bill_idx, "_Remaining"], 2),
+                    "Match_Confidence": round(rep["confidence"], 4),
+                    "Match_Method":     rep["method"] + "_CROSS_BRANCH",
+                    "Narration":        rep["narration"],
+                })
+
+                remaining_pool -= apply_to_bill
+
+            # Unmatched groups were already logged in Step 2 — don't double-log.
 
         return d1, s3, statement, kb_gaps
 
@@ -771,6 +1070,12 @@ class Reconciler:
         candidates["_date_parsed"] = pd.to_datetime(
             candidates["Date"], format="%d-%b-%Y", errors="coerce"
         )
+        nat_mask = candidates["_date_parsed"].isna()
+        if nat_mask.any():
+            print(
+                f"  ⚠  {nat_mask.sum()} bill(s) for '{resolved_name}' have unparseable dates "
+                f"and will be queued last in FIFO. Check debtors file for date format issues."
+            )
         candidates = candidates.sort_values("_date_parsed", na_position="last")
 
         # Find best amount match within tolerance
@@ -790,9 +1095,19 @@ class Reconciler:
                 # Full match (within tolerance)
                 # #30: Cap applied at bill_remaining to prevent money vanishing
                 applied = min(remaining_pay, bill_remaining)
+                underpayment_flagged = False
             elif remaining_pay > bill_remaining and not _within_tolerance(bill_remaining, remaining_pay):
                 # Payment larger than bill — apply full bill, carry remainder
                 applied = bill_remaining
+                underpayment_flagged = False
+            elif remaining_pay < bill_remaining:
+                # Only treat as underpayment if the payment is at least MIN_PARTIAL_RATIO
+                # of the bill. Payments below this threshold are instalment tranches —
+                # leave them pending so Step 2b aggregation can group them.
+                if remaining_pay < bill_remaining * MIN_PARTIAL_RATIO:
+                    continue
+                applied = remaining_pay
+                underpayment_flagged = True
             else:
                 continue
 
@@ -843,6 +1158,19 @@ class Reconciler:
                 "Match_Method":      method,
                 "Narration":         narration,
             })
+
+            if underpayment_flagged:
+                kb_gaps.append({
+                    "Vertical":          vertical,
+                    "Source":            source_type,
+                    "Date":              source_date,
+                    "Raw_Text":          raw_text,
+                    "Amount":            applied,
+                    "Narration":         narration,
+                    "Method":            method,
+                    "Suggested_Client":  resolved_name,
+                    "Action_Required":   GapReason.AMOUNT_MISMATCH,
+                })
 
             remaining_pay -= applied
             matched_any    = True
@@ -919,7 +1247,7 @@ def run_all_verticals(
     debtors_dfs:  dict,   # {saved_name: df}
     receipts_dfs: dict,   # {saved_name: df}
     suspense_dfs: dict,   # {saved_name: df}
-    kb_path:      str = "master_client_knowledge_base.json",
+    kb_path:      str = str(DATA_DIR / "master_client_knowledge_base.json"),
 ) -> dict:
     """
     Run reconciliation for all verticals and aggregate results.
@@ -972,7 +1300,44 @@ def run_all_verticals(
                  else pd.DataFrame()
 
         if r_vert.empty and s_vert.empty:
-            print(f"\n⚠  No receipts or suspense for vertical '{vertical}' — skipping")
+            receipt_verticals = all_receipts["Vertical"].unique().tolist() if not all_receipts.empty and "Vertical" in all_receipts.columns else []
+            suspense_verticals = all_suspense["Vertical"].unique().tolist() if not all_suspense.empty and "Vertical" in all_suspense.columns else []
+            print(
+                f"\n⚠  VERTICAL MISMATCH — '{vertical}' has {len(d_vert)} debtors bills but "
+                f"no matching receipts or suspense.\n"
+                f"   Receipt verticals detected:  {receipt_verticals}\n"
+                f"   Suspense verticals detected: {suspense_verticals}\n"
+                f"   Check that the uploaded files are for the correct entity."
+            )
+            # Record the skipped vertical in results so app.py can surface it
+            by_vertical[vertical] = {
+                "statement": pd.DataFrame(),
+                "updated_debtors": d_vert.copy(),
+                "updated_suspense": pd.DataFrame(),
+                "kb_gaps": pd.DataFrame(),
+                "advance_payments": pd.DataFrame(),
+                "unresolvable": pd.DataFrame(),
+                "summary": {
+                    "vertical": vertical,
+                    "skipped": True,
+                    "skip_reason": "no_receipts_or_suspense",
+                    "debtors_bills": len(d_vert),
+                    "bills_cleared": 0,
+                    "bills_partial": 0,
+                    "bills_open": len(d_vert),
+                    "total_debtors_initial": round(d_vert["Pending Amount"].apply(lambda x: pd.to_numeric(x, errors="coerce")).sum(), 2),
+                    "total_cleared": 0,
+                    "total_outstanding": round(d_vert["Pending Amount"].apply(lambda x: pd.to_numeric(x, errors="coerce")).sum(), 2),
+                    "suspense_entries": 0,
+                    "suspense_applied": 0,
+                    "suspense_remaining": 0,
+                    "statement_entries": 0,
+                    "kb_gaps": 0,
+                    "advance_payments": 0,
+                    "unresolvable": 0,
+                },
+            }
+            summaries.append(by_vertical[vertical]["summary"])
             continue
 
         result = rec.reconcile(d_vert, r_vert, s_vert, vertical)

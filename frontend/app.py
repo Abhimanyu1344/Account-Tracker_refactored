@@ -270,14 +270,47 @@ if st.session_state.show_upload_panel:
 
                         try:
                             if file_type == "Debtors":
-                                st.session_state.debtor_dfs[saved_name] = \
-                                    parse_debtor_file(f, vertical)
+                                existing_for_vertical = [
+                                    k for k, v in st.session_state.debtor_dfs.items()
+                                    if not v.empty and "Vertical" in v.columns
+                                    and v["Vertical"].iloc[0] == vertical
+                                ]
+                                if existing_for_vertical:
+                                    st.warning(
+                                        f"⚠️ A Debtors file for vertical **{vertical}** is already uploaded "
+                                        f"('{existing_for_vertical[0]}'). Remove it first or this file will be ignored."
+                                    )
+                                else:
+                                    st.session_state.debtor_dfs[saved_name] = \
+                                        parse_debtor_file(f, vertical)
                             elif file_type == "Suspense":
-                                st.session_state.suspense_dfs[saved_name] = \
-                                    parse_suspense_file(f, vertical)
+                                existing_for_vertical = [
+                                    k for k, v in st.session_state.suspense_dfs.items()
+                                    if not v.empty and "Vertical" in v.columns
+                                    and v["Vertical"].iloc[0] == vertical
+                                ]
+                                if existing_for_vertical:
+                                    st.warning(
+                                        f"⚠️ A Suspense file for vertical **{vertical}** is already uploaded "
+                                        f"('{existing_for_vertical[0]}'). Remove it first or this file will be ignored."
+                                    )
+                                else:
+                                    st.session_state.suspense_dfs[saved_name] = \
+                                        parse_suspense_file(f, vertical)
                             elif file_type == "Receipt":
-                                st.session_state.receipt_dfs[saved_name] = \
-                                    parse_receipt_file(f, vertical)
+                                existing_for_vertical = [
+                                    k for k, v in st.session_state.receipt_dfs.items()
+                                    if not v.empty and "Vertical" in v.columns
+                                    and v["Vertical"].iloc[0] == vertical
+                                ]
+                                if existing_for_vertical:
+                                    st.warning(
+                                        f"⚠️ A Receipt file for vertical **{vertical}** is already uploaded "
+                                        f"('{existing_for_vertical[0]}'). Remove it first or this file will be ignored."
+                                    )
+                                else:
+                                    st.session_state.receipt_dfs[saved_name] = \
+                                        parse_receipt_file(f, vertical)
                         except Exception as e:
                             st.warning(f"Could not parse {f.name}: {e}")
 
@@ -289,6 +322,37 @@ if st.session_state.show_upload_panel:
                     st.session_state.show_upload_panel = False
                     st.session_state.active_section    = file_type
                     st.rerun()
+
+        # Per-file delete section
+        any_files = (
+            st.session_state.debtor_dfs or
+            st.session_state.suspense_dfs or
+            st.session_state.receipt_dfs
+        )
+        if any_files:
+            st.divider()
+            st.markdown("**Manage uploaded files:**")
+            for label, dict_key in [
+                ("Debtors",  "debtor_dfs"),
+                ("Suspense", "suspense_dfs"),
+                ("Receipt",  "receipt_dfs"),
+            ]:
+                d = st.session_state[dict_key]
+                if d:
+                    st.markdown(f"*{label}*")
+                    for saved_name in list(d.keys()):
+                        col_name, col_btn = st.columns([6, 1])
+                        col_name.text(saved_name)
+                        if col_btn.button("❌", key=f"del_{dict_key}_{saved_name}"):
+                            del st.session_state[dict_key][saved_name]
+                            st.session_state.recon_ran = False
+                            st.rerun()
+            if st.button("🗑️ Clear All Files", key="clear_all_files_panel", type="secondary"):
+                st.session_state.debtor_dfs   = {}
+                st.session_state.suspense_dfs = {}
+                st.session_state.receipt_dfs  = {}
+                st.session_state.recon_ran    = False
+                st.rerun()
 
     st.divider()
 
@@ -718,6 +782,9 @@ if st.session_state.active_section == "Reconciliation":
                     )
                     display_stmt = apply_statement_presentation(df_stmt, for_excel=False)
 
+                    if "Bill Ref" in display_stmt.columns and "Payment Date" in display_stmt.columns:
+                        display_stmt = display_stmt.sort_values(["Bill Ref", "Payment Date"])
+
                     if "Confidence" in display_stmt.columns and raw_conf_list:
                         conf_idx_st = display_stmt.columns.get_loc("Confidence")
                         def _colour_conf_row(row):
@@ -735,6 +802,11 @@ if st.session_state.active_section == "Reconciliation":
                     else:
                         styled_stmt = display_stmt
 
+                    st.caption(
+                        "Each row represents one payment event. A single bill may appear multiple times "
+                        "if it was cleared across multiple payments. The 'Balance After' column shows the "
+                        "remaining amount after each individual payment."
+                    )
                     st.dataframe(styled_stmt, width="stretch", hide_index=True)
                 else:
                     st.info("No knock-off events recorded.")

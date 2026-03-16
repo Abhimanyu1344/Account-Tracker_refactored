@@ -28,7 +28,7 @@ MATCH_TOLERANCE = 0.015   # 1.5% tolerance for amount matching
 CLEARING_ROUNDING_THRESHOLD = 1.0   # ₹1
 
 # ── Reconciler Confidence ──────────────────────────────────────────────────────
-HIGH_CONF              = 0.88   # auto-accept match
+HIGH_CONF              = 0.88   # Reserved — intended for future 'flag for review' tier between LOW_CONF and HIGH_CONF
 LOW_CONF               = 0.50   # below this → unresolvable
 BRANCH_FUZZY_THRESHOLD = 0.82   # branch-aware fuzzy minimum score
 

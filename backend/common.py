@@ -207,9 +207,10 @@ class GapReason(str, Enum):
 class UnresolvableReason(str, Enum):
     """Reason codes for completely unresolvable entries."""
     NARRATION_UNPARSEABLE = "NARRATION_UNPARSEABLE"
-    NON_CLIENT_NARRATION = "NON_CLIENT_NARRATION"
-    CPV_CPD_UNDETERMINED = "CPV_CPD_UNDETERMINED"
-    NO_NARRATION = "NO_NARRATION"
+    NON_CLIENT_NARRATION  = "NON_CLIENT_NARRATION"
+    CPV_CPD_UNDETERMINED  = "CPV_CPD_UNDETERMINED"
+    NO_NARRATION          = "NO_NARRATION"
+    CONFIDENCE_TOO_LOW    = "CONFIDENCE_TOO_LOW"
 
 
 class BillStatus(str, Enum):

@@ -266,6 +266,7 @@ def parse_debtor_file(file_obj, vertical: str) -> pd.DataFrame:
 
     today = date.today()
     rows_data = []
+    skipped_date_rows = []
 
     data_start, col_map = _detect_columns(ws)
     if not col_map:
@@ -291,12 +292,15 @@ def parse_debtor_file(file_obj, vertical: str) -> pd.DataFrame:
 
         bill_date = _parse_date(date_val)
         if not bill_date:
+            skipped_date_rows.append(str(date_val))
             continue
 
         days_overdue = (today - bill_date).days
         raw_party    = str(party).strip() if party else ""
         std_party    = standardise_party_name(raw_party)
-        state        = map_state(raw_party)
+        # Use standardised name for state mapping — raw_party may have branch suffix (e.g. _JAIPUR)
+        # that prevents lookup. std_party has already been normalised through PNM.
+        state        = map_state(std_party)
 
         rows_data.append({
             "Vertical":       vertical,
@@ -313,6 +317,12 @@ def parse_debtor_file(file_obj, vertical: str) -> pd.DataFrame:
 
     wb.close()
     file_obj.seek(0)
+    if skipped_date_rows:
+        print(
+            f"⚠  Debtors [{vertical}]: {len(skipped_date_rows)} rows skipped — "
+            f"unparseable date values: {skipped_date_rows[:5]}"
+            f"{'  ...' if len(skipped_date_rows) > 5 else ''}"
+        )
     df = pd.DataFrame(rows_data)
     if not df.empty and "Pending Amount" in df.columns:
         non_numeric = df["Pending Amount"].apply(

@@ -103,6 +103,7 @@ class Validator:
         # Pass 2: Substring match
         best_sub = None
         best_sub_score = 0
+        best_sub_kw_len = 0
 
         for kw, hit in self.keyword_map.items():
             if kw in norm_text or norm_text in kw:
@@ -116,13 +117,19 @@ class Validator:
                 if score > best_sub_score:
                     best_sub_score = score
                     best_sub = hit
+                    best_sub_kw_len = len(kw)
 
-        if best_sub:
+        _MIN_SUBSTRING_KW_LENGTH = 8  # Ignore keywords shorter than this for substring matching
+
+        if best_sub and best_sub_kw_len >= _MIN_SUBSTRING_KW_LENGTH:
+            # Score based on what fraction of the input text the keyword covers.
+            # A 30-char keyword in a 40-char input scores ~0.95. A 5-char keyword in 100-char input scores ~0.05.
+            computed_score = min(best_sub_kw_len / max(len(norm_text), 1), 0.95)
             return {
                 "Client_ID":     best_sub["id"],
                 "Official_Name": best_sub["official_name"],
                 "Match_Method":  "SUBSTRING",
-                "Match_Score":   0.95,
+                "Match_Score":   round(computed_score, 4),
             }
 
         # Pass 3: Fuzzy match
@@ -234,6 +241,43 @@ def _clean_candidate(candidate: str) -> str:
 
     s = candidate.strip()
 
+    # Step 0 — Strip bank routing artifacts injected by NEFT/RTGS systems.
+    # Runs before all other cleaning. Patterns are tried in order — most
+    # specific first.
+    _BANK_ARTIFACT_PATTERNS = [
+        # Routing tags with leading slash
+        r'[-/]\s*/FAST///NOT ELIGIBLE.*$',
+        r'[-/]\s*/ATTN//INB//.*$',
+        r'[-/]\s*//ATTN/.*$',
+        r'[-/]\s*/CUST/\s*.*$',
+        # Double-dash voucher references (INCRED --VI000xxxxx)
+        r'--[A-Z]{2}\d{5,}.*$',
+        # Treasury account designation
+        r'\s+TREASURY\s+AC\b.*$',
+        # Expense type descriptions
+        r'[-/]\s*PAYMENT\s+FOR\s+LEGAL.*$',
+        r'[-/]\s*LEGAL\s+DOC\s+CHARGES.*$',
+        r'[-/]\s*LEGAL\s+SERVICES.*$',
+        r'[-/]\s*PROPERTYVALUATION.*$',
+        r'[-/]\s*VENDORPAYMENT\d*.*$',
+        r'[-/]\s*FILE\s+PROCESSING.*$',
+        r'[-/]\s*RCU\s+EXPENSE.*$',
+        r'[-/]\s*HR\s+FI\s+EXPENSES.*$',
+        r'[-/]\s*INVOICE\s+\d+.*$',
+        # CMS reference embedded in name
+        r'[-/]\s*PAYMENT//CMS\d+.*$',
+        # Collection city suffix
+        r'\s*-\s*COLL\s+[A-Z]+\s*-?\s*$',
+        # LAP loan reference
+        r'[-/]\s*LAP[-/][A-Z0-9]+.*$',
+        # Trailing pure-digit account numbers (6+ digits)
+        r'\s*[-/]\s*\d{6,}.*$',
+    ]
+    for pattern in _BANK_ARTIFACT_PATTERNS:
+        s = re.sub(pattern, '', s, flags=re.IGNORECASE).strip()
+    # Clean up any trailing dash or slash left after stripping
+    s = re.sub(r'[-/\s]+$', '', s).strip()
+
     # Step 1: Strip trailing operational suffixes (longest first)
     _OP_SUFFIXES = [
         'EXPENSES ACCOUNT', 'EXPENSE ACCOUNT',
@@ -257,12 +301,23 @@ def _clean_candidate(candidate: str) -> str:
         'PVT', 'LTD', 'LLP', 'INC', 'CO', 'CORP', 'PLC',
         'AND', 'OF', 'THE', 'FOR',
         'HOME', 'FUND', 'BANK', 'TECH',
-        'ILTD',
+        'ILTD', 'LIMITED', 'PRIVATE', 'CAPITAL', 'FINANCE',
+        'HOUSING', 'SERVICES', 'SOLUTIONS', 'FINSERV',
+    }
+    _STRIP_TRAILING = {
+        'BRANCH', 'JAIPUR', 'MUMBAI', 'DELHI', 'CHENNAI', 'KOLKATA',
+        'BANGALORE', 'HYDERABAD', 'PUNE', 'AHMEDABAD', 'SURAT',
+        'AGRA', 'KURNOOL', 'GURGAON', 'NOIDA', 'LUCKNOW',
     }
     parts = s.split()
+    # Strip known trailing noise words (cities, generic labels) regardless of length
+    while parts and parts[-1].upper() in _STRIP_TRAILING:
+        parts = parts[:-1]
+    # Strip short unrecognised trailing words (original logic, preserved)
     if parts and len(parts[-1]) <= 5 and parts[-1].upper() not in _VALID_SUFFIXES:
         if re.match(r'^[A-Z]+$', parts[-1], re.IGNORECASE):
-            s = ' '.join(parts[:-1]).strip()
+            parts = parts[:-1]
+    s = ' '.join(parts).strip()
 
     return s.strip()
 
@@ -287,13 +342,64 @@ def _parse_neft_client(narration: str) -> str:
 
     # Pattern 1: NEFT-BANKCODE-CLIENT NAME-...
     if n.upper().startswith("NEFT"):
-        parts = re.split(r"\s*-\s*", n)
-        if len(parts) >= 3:
-            candidate = parts[2].strip()
+        # Bank NEFT format: NEFT-<IFSC/BANKCODE>-<CLIENT NAME>-<optional extras>
+        # IFSC/bank codes follow pattern: letters followed by digits (e.g. AUBLH0322318047, HDFC0001234)
+        # Use regex to skip the bank code segment rather than relying on positional split.
+        neft_match = re.match(
+            r'^NEFT\s*[-/]\s*[A-Z]{2,10}\d+\w*\s*[-/]\s*(.+?)(?:\s*[-/]\s*\d{4,}.*)?$',
+            n, re.IGNORECASE
+        )
+        if neft_match:
+            candidate = neft_match.group(1).strip()
+
+            # Self-repeat truncation — hyphen-split version.
+            # Handles: "MOTILAL OSWAL HOME FINANCE LIMITED-MOTILAL OSWAL HOME F"
+            # where the repeat is joined without spaces around the hyphen.
+            hyp_parts = [p.strip() for p in candidate.split('-') if p.strip()]
+            if len(hyp_parts) >= 2:
+                for pivot in range(1, len(hyp_parts)):
+                    seg_a = hyp_parts[pivot - 1].upper()
+                    seg_b = hyp_parts[pivot].upper()
+                    check_len = max(8, len(seg_b) - 4)
+                    if len(seg_a) >= 8 and seg_a[:check_len] in seg_b or seg_b[:check_len] in seg_a:
+                        candidate = '-'.join(hyp_parts[:pivot]).strip()
+                        break
+
             candidate = re.sub(r"\s+\d+\s*$", "", candidate).strip()
             candidate = _clean_candidate(candidate)
             if len(candidate) > 4:
                 return candidate
+        else:
+            # Fallback to positional split if regex does not match
+            parts = re.split(r"\s*-\s*", n)
+            if len(parts) >= 3:
+                candidate = parts[2].strip()
+
+                hyp_parts = [p.strip() for p in candidate.split('-') if p.strip()]
+                if len(hyp_parts) >= 2:
+                    for pivot in range(1, len(hyp_parts)):
+                        seg_a = hyp_parts[pivot - 1].upper()
+                        seg_b = hyp_parts[pivot].upper()
+                        check_len = max(8, len(seg_b) - 4)
+                        if len(seg_a) >= 8 and seg_a[:check_len] in seg_b or seg_b[:check_len] in seg_a:
+                            candidate = '-'.join(hyp_parts[:pivot]).strip()
+                            break
+
+                candidate = re.sub(r"\s+\d+\s*$", "", candidate).strip()
+                candidate = _clean_candidate(candidate)
+                if len(candidate) > 4:
+                    return candidate
+
+    # NEFT CR- format: NEFT CR-<REFNO> -<CLIENT NAME> -<IFSC> -<optional>
+    neft_cr_match = re.match(
+        r'^NEFT\s+CR[-/]\s*\w+\s+-\s*(.+?)\s*-\s*[A-Z]{4}\d.*$',
+        n, re.IGNORECASE
+    )
+    if neft_cr_match:
+        candidate = neft_cr_match.group(1).strip()
+        candidate = _clean_candidate(candidate)
+        if len(candidate) > 4:
+            return candidate
 
     # Pattern 2: CMS/ REFNO TDS AMOUNT /CLIENT NAME
     cms = re.search(r"/([A-Z][A-Z\s&.()\-']+?)(?:\s*$)", n, re.IGNORECASE)
@@ -311,12 +417,19 @@ def _parse_neft_client(narration: str) -> str:
                 return candidate
 
     # Pattern 3: SGB/.../CLIENT NAME/FT
+    _SGB_SKIP_SEGMENTS = {
+        'FT', 'NEFT', 'RTGS', 'IMPS', 'UPI',
+        'DELHI', 'MUMBAI', 'JAIPUR', 'CHENNAI', 'KOLKATA',
+        'BANGALORE', 'HYDERABAD', 'PUNE', 'AHMEDABAD',
+        'AGRA', 'KURNOOL', 'GURGAON', 'NOIDA', 'LUCKNOW',
+        'NORTH', 'SOUTH', 'EAST', 'WEST', 'CENTRAL',
+    }
     if not n.upper().startswith("INF"):
         sgb = re.findall(r"/([A-Z][A-Z\s&.()\-']+?)(?:/|$)", n, re.IGNORECASE)
         for candidate in reversed(sgb):
-            candidate = _clean_candidate(candidate.strip())
-            if len(candidate) > 4 and not re.match(r"^FT\s*$", candidate, re.I):
-                return candidate
+            cleaned = _clean_candidate(candidate.strip())
+            if len(cleaned) > 4 and cleaned.upper() not in _SGB_SKIP_SEGMENTS and not _is_non_client(cleaned):
+                return cleaned
 
     # Pattern 5: RTGS CR-BANKREF -CLIENT NAME -...
     if "RTGS" in n.upper():
@@ -457,7 +570,17 @@ class ClientResolver:
                 official = kb_result["Official_Name"]
 
                 bridged = self.kb_bridge.get(official.upper())
-                if bridged and bridged in self.debtors_names:
+                if bridged:
+                    bridged_base = _normalise_base(_extract_client_base(bridged))
+                    bridged_match = next(
+                        (n for n in self.debtors_names
+                         if _normalise_base(_extract_client_base(n)) == bridged_base),
+                        None
+                    )
+                else:
+                    bridged_match = None
+                if bridged and bridged_match:
+                    bridged = bridged_match
                     return ResolutionResult(
                         resolved_name=bridged,
                         confidence=kb_result["Match_Score"],
@@ -465,9 +588,15 @@ class ClientResolver:
                         raw_text=text,
                     )
 
+                if not any(
+                    _normalise_base(_extract_client_base(d)) == _normalise_base(_extract_client_base(official))
+                    for d in self.debtors_names
+                ):
+                    print(f"  ⚠  KB match '{official}' found no debtors name via bridge or base — goes to next pass")
+
                 for dname in self.debtors_names:
-                    base_d = _extract_client_base(dname)
-                    base_o = _extract_client_base(official)
+                    base_d = _normalise_base(_extract_client_base(dname))
+                    base_o = _normalise_base(_extract_client_base(official))
                     if base_d and base_o and base_d == base_o:
                         return ResolutionResult(
                             resolved_name=dname,
